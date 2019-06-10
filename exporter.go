@@ -6,13 +6,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"reflect"
-	"os"
+
+	redisc "github.com/go-redis/redis"
 
 	redisc "github.com/go-redis/redis"
 
@@ -64,7 +66,7 @@ type ExporterOptions struct {
 	SkipTLSVerification bool
 	IsTile38            bool
 	ConnectionTimeouts  time.Duration
-	ClusterDiscovery 	bool
+	ClusterDiscovery    bool
 }
 
 // ScrapeHandler is the HTTP handler to gather metrics.
@@ -93,7 +95,6 @@ func (e *Exporter) ScrapeHandler(w http.ResponseWriter, r *http.Request) {
 	opts := e.options
 	opts.CheckKeys = checkKeys
 	opts.CheckSingleKeys = checkSingleKey
-
 
 	log.Info("NEW EXPORTER")
 	exp, err := NewRedisExporter(target, opts)
@@ -366,14 +367,12 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			e.registerConstMetricGauge(ch, "exporter_last_scrape_error", 0, "")
 		}
 
-
 		rc, err := NewCluster(e)
 		if err != nil {
 			fmt.Println("ERROR getting redis cluster")
 		}
 		log.Debug(rc)
 
-	
 		// cn, err := NewClusterNodes(e)
 		// if err != nil {
 		// 	log.Debug(err)
@@ -1117,32 +1116,29 @@ func (e *Exporter) scrapeRedisHost(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
-
 type Cluster struct {
-	Connection *redisc.Client
+	Connection   *redisc.Client
 	ClusterNodes []*ClusterNode
 }
 
 type ClusterNode struct {
-	Exporter *Exporter
-	NodeID string
-	Addr string
-	Flags string
-	MasterID string
-	PingSent string
-	PongRecv string
+	Exporter    *Exporter
+	NodeID      string
+	Addr        string
+	Flags       string
+	MasterID    string
+	PingSent    string
+	PongRecv    string
 	ConfigEpoch string
-	LinkState string
-	Slots string
+	LinkState   string
+	Slots       string
 }
-
 
 func NewCluster(e *Exporter) (*Cluster, error) {
 
-
 	fmt.Println(e)
 	rcc := redisc.NewClient(&redisc.Options{
-		Addr:     e.redisAddr+":6379",
+		Addr: e.redisAddr + ":6379",
 	})
 	rc := Cluster{
 		Connection: rcc,
@@ -1164,9 +1160,9 @@ func NewCluster(e *Exporter) (*Cluster, error) {
 			continue
 		}
 		node := &ClusterNode{
-			NodeID: sArr[0],
-			Addr: sArr[1],
-			Flags: sArr[2],
+			NodeID:   sArr[0],
+			Addr:     sArr[1],
+			Flags:    sArr[2],
 			MasterID: sArr[3],
 		}
 
@@ -1184,7 +1180,6 @@ func NewCluster(e *Exporter) (*Cluster, error) {
 			os.Exit(1)
 		}
 		log.Debug(ne)
-
 
 		log.Info("> Node ", node)
 		rc.ClusterNodes = append(rc.ClusterNodes, node)
