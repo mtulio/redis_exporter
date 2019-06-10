@@ -11,6 +11,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"reflect"
+	"os"
+
+	redisc "github.com/go-redis/redis"
 
 	"github.com/gomodule/redigo/redis"
 	"github.com/prometheus/client_golang/prometheus"
@@ -49,6 +53,7 @@ type Exporter struct {
 	metricMapGauges   map[string]string
 }
 
+// ExporterOptions is the configuration of Redis Exporter
 type ExporterOptions struct {
 	Password            string
 	Namespace           string
@@ -59,8 +64,10 @@ type ExporterOptions struct {
 	SkipTLSVerification bool
 	IsTile38            bool
 	ConnectionTimeouts  time.Duration
+	ClusterDiscovery 	bool
 }
 
+// ScrapeHandler is the HTTP handler to gather metrics.
 func (e *Exporter) ScrapeHandler(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("target")
 	if target == "" {
@@ -87,12 +94,24 @@ func (e *Exporter) ScrapeHandler(w http.ResponseWriter, r *http.Request) {
 	opts.CheckKeys = checkKeys
 	opts.CheckSingleKeys = checkSingleKey
 
+
+	log.Info("NEW EXPORTER")
 	exp, err := NewRedisExporter(target, opts)
 	if err != nil {
 		http.Error(w, "NewRedisExporter() err: err", 400)
 		e.targetScrapeRequestErrors.Inc()
 		return
 	}
+	rc, err := NewCluster(exp)
+	if err != nil {
+		log.Debug(err)
+		return
+	}
+	log.Info(rc)
+	// for i := range cn.Exporters {
+	// 	log.Info(i)
+	// }
+
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(exp)
 
@@ -335,6 +354,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.Lock()
 	defer e.Unlock()
 	e.totalScrapes.Inc()
+	log.Info("Collect()")
 
 	if e.redisAddr != "" {
 		start := time.Now().UnixNano()
@@ -345,6 +365,33 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		} else {
 			e.registerConstMetricGauge(ch, "exporter_last_scrape_error", 0, "")
 		}
+
+
+		rc, err := NewCluster(e)
+		if err != nil {
+			fmt.Println("ERROR getting redis cluster")
+		}
+		log.Debug(rc)
+
+	
+		// cn, err := NewClusterNodes(e)
+		// if err != nil {
+		// 	log.Debug(err)
+		// 	return
+		// }
+		// rccNodes, err := rcc.ClusterNodes().Result()
+		// if err != nil {
+		// 	log.Println("Unable to conn to ipirang")
+		// }
+
+		// // fmt.Println(pong, err)
+		// log.Info(reflect.TypeOf(rccNodes))
+		// // log.Info(rccNodes)
+		// // log.Info()
+		// // log.Info(cn)
+		// for _, v := range strings.Split(rccNodes, "\n") {
+		// 	log.Info(v)
+		// }
 
 		e.registerConstMetricGauge(ch, "up", up)
 		e.registerConstMetricGauge(ch, "exporter_last_scrape_duration_seconds", float64(time.Now().UnixNano()-start)/1000000000)
@@ -1068,4 +1115,81 @@ func (e *Exporter) scrapeRedisHost(ch chan<- prometheus.Metric) error {
 
 	log.Debugf("scrapeRedisHost() done")
 	return nil
+}
+
+
+type Cluster struct {
+	Connection *redisc.Client
+	ClusterNodes []*ClusterNode
+}
+
+type ClusterNode struct {
+	Exporter *Exporter
+	NodeID string
+	Addr string
+	Flags string
+	MasterID string
+	PingSent string
+	PongRecv string
+	ConfigEpoch string
+	LinkState string
+	Slots string
+}
+
+
+func NewCluster(e *Exporter) (*Cluster, error) {
+
+
+	fmt.Println(e)
+	rcc := redisc.NewClient(&redisc.Options{
+		Addr:     e.redisAddr+":6379",
+	})
+	rc := Cluster{
+		Connection: rcc,
+	}
+
+	rccNodes, err := rcc.ClusterNodes().Result()
+	if err != nil {
+		log.Println("Unable to conn to ipirang")
+	}
+	log.Info(reflect.TypeOf(rccNodes))
+	for i, v := range strings.Split(rccNodes, "\n") {
+
+		log.Info(">>> ", i)
+		// log.Info(v)
+		sArr := strings.Split(v, " ")
+		log.Info(sArr)
+		// log.Info(len(sArr))
+		if len(sArr) < 4 {
+			continue
+		}
+		node := &ClusterNode{
+			NodeID: sArr[0],
+			Addr: sArr[1],
+			Flags: sArr[2],
+			MasterID: sArr[3],
+		}
+
+		node.PingSent = sArr[4]
+		node.ConfigEpoch = sArr[5]
+		node.PongRecv = sArr[6]
+		node.LinkState = sArr[7]
+		// Slave
+		if len(sArr) > 8 {
+			node.Slots = sArr[8]
+		}
+		ne, err := NewRedisExporter(node.Addr, ExporterOptions{})
+		if err != nil {
+			log.Errorf("Error calling newRediExposter")
+			os.Exit(1)
+		}
+		log.Debug(ne)
+
+
+		log.Info("> Node ", node)
+		rc.ClusterNodes = append(rc.ClusterNodes, node)
+		log.Info(rc)
+	}
+
+	return &rc, nil
 }

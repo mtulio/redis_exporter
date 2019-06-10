@@ -54,6 +54,7 @@ func main() {
 		redisMetricsOnly    = flag.Bool("redis-only-metrics", getEnvBool("REDIS_EXPORTER_REDIS_ONLY_METRICS"), "Whether to also export go runtime metrics")
 		inclSystemMetrics   = flag.Bool("include-system-metrics", getEnvBool("REDIS_EXPORTER_INCL_SYSTEM_METRICS"), "Whether to include system metrics like e.g. redis_total_system_memory_bytes")
 		skipTLSVerification = flag.Bool("skip-tls-verification", getEnvBool("REDIS_EXPORTER_SKIP_TLS_VERIFICATION"), "Whether to to skip TLS verification")
+		clusterDiscovery = flag.Bool("cluster-discovery", getEnvBool("REDIS_EXPORTER_CLUSTER_DISCOVERY"), "Use discovery mode to gather metrics from the all nodes on the cluster")
 	)
 	flag.Parse()
 
@@ -95,6 +96,7 @@ func main() {
 			IsTile38:            *isTile38,
 			SkipTLSVerification: *skipTLSVerification,
 			ConnectionTimeouts:  to,
+			ClusterDiscovery: 	 *clusterDiscovery,
 		},
 	)
 	if err != nil {
