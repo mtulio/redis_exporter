@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -89,10 +88,11 @@ func (e *Exporter) ScrapeHandler(w http.ResponseWriter, r *http.Request) {
 	u.User = nil
 	target = u.String()
 
+	opts := e.options
+
+	// doest it work?
 	checkKeys := r.URL.Query().Get("check-keys")
 	checkSingleKey := r.URL.Query().Get("check-single-keys")
-
-	opts := e.options
 	opts.CheckKeys = checkKeys
 	opts.CheckSingleKeys = checkSingleKey
 
@@ -103,15 +103,6 @@ func (e *Exporter) ScrapeHandler(w http.ResponseWriter, r *http.Request) {
 		e.targetScrapeRequestErrors.Inc()
 		return
 	}
-	rc, err := NewCluster(exp)
-	if err != nil {
-		log.Debug(err)
-		return
-	}
-	log.Info(rc)
-	// for i := range cn.Exporters {
-	// 	log.Info(i)
-	// }
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(exp)
@@ -147,8 +138,12 @@ func parseKeyArg(keysArgString string) (keys []dbKeyPair, err error) {
 	return keys, err
 }
 
-func newMetricDescr(namespace string, metricName string, docString string, labels []string) *prometheus.Desc {
-	return prometheus.NewDesc(prometheus.BuildFQName(namespace, "", metricName), docString, labels, nil)
+func (e *Exporter) newMetricDescr(namespace string, metricName string, docString string, labels []string) *prometheus.Desc {
+	return prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "", metricName),
+		docString,
+		labels,
+		prometheus.Labels{"node": e.redisAddr})
 }
 
 // NewRedisExporter returns a new exporter of Redis metrics.
@@ -325,10 +320,15 @@ func NewRedisExporter(redisURI string, opts ExporterOptions) (*Exporter, error) 
 		"start_time_seconds":                   {txt: "Start time of the Redis instance since unix epoch in seconds."},
 		"up":                                   {txt: "Information about the Redis instance"},
 	} {
-		e.metricDescriptions[k] = newMetricDescr(opts.Namespace, k, desc.txt, desc.lbls)
+		e.metricDescriptions[k] = e.newMetricDescr(opts.Namespace, k, desc.txt, desc.lbls)
 	}
 
 	return &e, nil
+}
+
+// GetRedisAddr return internal redis address.
+func (e *Exporter) GetRedisAddr() string {
+	return e.redisAddr
 }
 
 // Describe outputs Redis metric descriptions.
@@ -338,11 +338,11 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	}
 
 	for _, v := range e.metricMapGauges {
-		ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil)
+		ch <- e.newMetricDescr(e.options.Namespace, v, v+" metric", nil)
 	}
 
 	for _, v := range e.metricMapCounters {
-		ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil)
+		ch <- e.newMetricDescr(e.options.Namespace, v, v+" metric", nil)
 	}
 
 	ch <- e.totalScrapes.Desc()
@@ -355,7 +355,6 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.Lock()
 	defer e.Unlock()
 	e.totalScrapes.Inc()
-	log.Info("Collect()")
 
 	if e.redisAddr != "" {
 		start := time.Now().UnixNano()
@@ -366,31 +365,6 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		} else {
 			e.registerConstMetricGauge(ch, "exporter_last_scrape_error", 0, "")
 		}
-
-		rc, err := NewCluster(e)
-		if err != nil {
-			fmt.Println("ERROR getting redis cluster")
-		}
-		log.Debug(rc)
-
-		// cn, err := NewClusterNodes(e)
-		// if err != nil {
-		// 	log.Debug(err)
-		// 	return
-		// }
-		// rccNodes, err := rcc.ClusterNodes().Result()
-		// if err != nil {
-		// 	log.Println("Unable to conn to ipirang")
-		// }
-
-		// // fmt.Println(pong, err)
-		// log.Info(reflect.TypeOf(rccNodes))
-		// // log.Info(rccNodes)
-		// // log.Info()
-		// // log.Info(cn)
-		// for _, v := range strings.Split(rccNodes, "\n") {
-		// 	log.Info(v)
-		// }
 
 		e.registerConstMetricGauge(ch, "up", up)
 		e.registerConstMetricGauge(ch, "exporter_last_scrape_duration_seconds", float64(time.Now().UnixNano()-start)/1000000000)
@@ -546,7 +520,7 @@ func (e *Exporter) registerConstMetricGauge(ch chan<- prometheus.Metric, metric 
 func (e *Exporter) registerConstMetric(ch chan<- prometheus.Metric, metric string, val float64, valType prometheus.ValueType, labelValues ...string) {
 	descr := e.metricDescriptions[metric]
 	if descr == nil {
-		descr = newMetricDescr(e.options.Namespace, metric, metric+" metric", nil)
+		descr = e.newMetricDescr(e.options.Namespace, metric, metric+" metric", nil)
 	}
 
 	ch <- prometheus.MustNewConstMetric(descr, valType, val, labelValues...)
@@ -1116,9 +1090,21 @@ func (e *Exporter) scrapeRedisHost(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
-type Cluster struct {
+// Redis Cluster implementation
+
+type ClusterExporter struct {
+	sync.Mutex
+
 	Connection   *redisc.Client
 	ClusterNodes []*ClusterNode
+
+	promRegistry  *prometheus.Registry
+	promGatherers *prometheus.Gatherers
+
+	mTotalScrapes              prometheus.Counter
+	mScrapeDuration            prometheus.Summary
+	mTargetScrapeRequestErrors prometheus.Counter
+	mTotalNodes                prometheus.Gauge
 }
 
 type ClusterNode struct {
@@ -1134,32 +1120,51 @@ type ClusterNode struct {
 	Slots       string
 }
 
-func NewCluster(e *Exporter) (*Cluster, error) {
+func NewClusterExporter(addr string, opts ExporterOptions) (*ClusterExporter, error) {
 
-	fmt.Println(e)
 	rcc := redisc.NewClient(&redisc.Options{
-		Addr: e.redisAddr + ":6379",
+		Addr: addr,
 	})
-	rc := Cluster{
+	ce := ClusterExporter{
 		Connection: rcc,
+		mTotalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: opts.Namespace,
+			Name:      "exporter_scrapes_total",
+			Help:      "Current total redis scrapes.",
+		}),
+
+		mScrapeDuration: prometheus.NewSummary(prometheus.SummaryOpts{
+			Name: "exporter_scrape_duration_seconds",
+			Help: "Duration of scrape by the exporter",
+		}),
+
+		mTargetScrapeRequestErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: opts.Namespace,
+			Name:      "target_scrape_request_errors_total",
+			Help:      "Errors in requests to the exporter",
+		}),
+		mTotalNodes: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: opts.Namespace,
+				Name:      "cluster_total_nodes",
+				Help:      "Total nodes of Redis Cluster",
+			},
+		),
 	}
 
 	rccNodes, err := rcc.ClusterNodes().Result()
 	if err != nil {
 		log.Println("Unable to conn to ipirang")
 	}
-	log.Info(reflect.TypeOf(rccNodes))
-	for i, v := range strings.Split(rccNodes, "\n") {
 
-		log.Info(">>> ", i)
-		// log.Info(v)
+	nodesCounter := 0.0
+	for _, v := range strings.Split(rccNodes, "\n") {
+
 		sArr := strings.Split(v, " ")
-		log.Info(sArr)
-		// log.Info(len(sArr))
 		if len(sArr) < 4 {
 			continue
 		}
-		node := &ClusterNode{
+		node := ClusterNode{
 			NodeID:   sArr[0],
 			Addr:     sArr[1],
 			Flags:    sArr[2],
@@ -1170,21 +1175,53 @@ func NewCluster(e *Exporter) (*Cluster, error) {
 		node.ConfigEpoch = sArr[5]
 		node.PongRecv = sArr[6]
 		node.LinkState = sArr[7]
+
 		// Slave
 		if len(sArr) > 8 {
 			node.Slots = sArr[8]
 		}
-		ne, err := NewRedisExporter(node.Addr, ExporterOptions{})
+
+		ne, err := NewRedisExporter(node.Addr, opts)
 		if err != nil {
 			log.Errorf("Error calling newRediExposter")
 			os.Exit(1)
 		}
 		log.Debug(ne)
 
-		log.Info("> Node ", node)
-		rc.ClusterNodes = append(rc.ClusterNodes, node)
-		log.Info(rc)
+		node.Exporter = ne
+		ce.Lock()
+		ce.ClusterNodes = append(ce.ClusterNodes, &node)
+		ce.Unlock()
+
+		nodesCounter++
 	}
 
-	return &rc, nil
+	ce.mTotalNodes.Set(nodesCounter)
+
+	return &ce, nil
+}
+
+//Collect implements required collect function for all promehteus collectors
+func (ce *ClusterExporter) Collect(ch chan<- prometheus.Metric) {
+	wg := sync.WaitGroup{}
+	wg.Add(len(ce.ClusterNodes))
+
+	for _, c := range ce.ClusterNodes {
+		go func(node *ClusterNode) {
+			defer wg.Done()
+			node.Exporter.Collect(ch)
+		}(c)
+	}
+	wg.Wait()
+}
+
+//Describe is a Prometheus implementation to be called by collector.
+//It essentially writes all descriptors to the prometheus desc channel.
+func (ce *ClusterExporter) Describe(ch chan<- *prometheus.Desc) {
+
+	//Update this section with the each metric you create for a given collector
+	ch <- ce.mTotalScrapes.Desc()
+	ch <- ce.mScrapeDuration.Desc()
+	ch <- ce.mTargetScrapeRequestErrors.Desc()
+	ch <- ce.mTotalNodes.Desc()
 }
