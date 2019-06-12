@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -52,6 +51,7 @@ type Exporter struct {
 
 	metricMapCounters map[string]string
 	metricMapGauges   map[string]string
+	staticLabels      *prometheus.Labels
 }
 
 // ExporterOptions is the configuration of Redis Exporter
@@ -96,10 +96,10 @@ func (e *Exporter) ScrapeHandler(w http.ResponseWriter, r *http.Request) {
 	opts.CheckKeys = checkKeys
 	opts.CheckSingleKeys = checkSingleKey
 
-	log.Info("NEW EXPORTER")
 	exp, err := NewRedisExporter(target, opts)
 	if err != nil {
-		http.Error(w, "NewRedisExporter() err: err", 400)
+		errMsg := fmt.Sprintf("NewRedisExporter() err: ", err)
+		http.Error(w, errMsg, 500)
 		e.targetScrapeRequestErrors.Inc()
 		return
 	}
@@ -138,12 +138,12 @@ func parseKeyArg(keysArgString string) (keys []dbKeyPair, err error) {
 	return keys, err
 }
 
-func (e *Exporter) newMetricDescr(namespace string, metricName string, docString string, labels []string) *prometheus.Desc {
+func newMetricDescr(namespace string, metricName string, docString string, labels []string, staticLabels *prometheus.Labels) *prometheus.Desc {
 	return prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", metricName),
 		docString,
 		labels,
-		prometheus.Labels{"node": e.redisAddr})
+		*staticLabels)
 }
 
 // NewRedisExporter returns a new exporter of Redis metrics.
@@ -270,6 +270,10 @@ func NewRedisExporter(redisURI string, opts ExporterOptions) (*Exporter, error) 
 			"used_cpu_sys_children":  "cpu_sys_children_seconds_total",
 			"used_cpu_user_children": "cpu_user_children_seconds_total",
 		},
+
+		staticLabels: &prometheus.Labels{
+			"node": redisURI,
+		},
 	}
 
 	if e.options.ConfigCommandName == "" {
@@ -320,7 +324,7 @@ func NewRedisExporter(redisURI string, opts ExporterOptions) (*Exporter, error) 
 		"start_time_seconds":                   {txt: "Start time of the Redis instance since unix epoch in seconds."},
 		"up":                                   {txt: "Information about the Redis instance"},
 	} {
-		e.metricDescriptions[k] = e.newMetricDescr(opts.Namespace, k, desc.txt, desc.lbls)
+		e.metricDescriptions[k] = newMetricDescr(opts.Namespace, k, desc.txt, desc.lbls, e.staticLabels)
 	}
 
 	return &e, nil
@@ -338,11 +342,11 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	}
 
 	for _, v := range e.metricMapGauges {
-		ch <- e.newMetricDescr(e.options.Namespace, v, v+" metric", nil)
+		ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil, e.staticLabels)
 	}
 
 	for _, v := range e.metricMapCounters {
-		ch <- e.newMetricDescr(e.options.Namespace, v, v+" metric", nil)
+		ch <- newMetricDescr(e.options.Namespace, v, v+" metric", nil, e.staticLabels)
 	}
 
 	ch <- e.totalScrapes.Desc()
@@ -520,10 +524,22 @@ func (e *Exporter) registerConstMetricGauge(ch chan<- prometheus.Metric, metric 
 func (e *Exporter) registerConstMetric(ch chan<- prometheus.Metric, metric string, val float64, valType prometheus.ValueType, labelValues ...string) {
 	descr := e.metricDescriptions[metric]
 	if descr == nil {
-		descr = e.newMetricDescr(e.options.Namespace, metric, metric+" metric", nil)
+		descr = newMetricDescr(e.options.Namespace, metric, metric+" metric", nil, e.staticLabels)
 	}
 
-	ch <- prometheus.MustNewConstMetric(descr, valType, val, labelValues...)
+	// ch <- prometheus.MustNewConstMetric(descr, valType, val, labelValues...)
+	registerConstMetric(descr, ch, val, valType, labelValues)
+}
+
+func registerConstMetric(desc *prometheus.Desc,
+	ch chan<- prometheus.Metric,
+	val float64,
+	valType prometheus.ValueType,
+	labelValues []string) {
+	ch <- prometheus.MustNewConstMetric(
+		desc,
+		valType, val, labelValues...,
+	)
 }
 
 func (e *Exporter) handleMetricsCommandStats(ch chan<- prometheus.Metric, fieldKey string, fieldValue string) {
@@ -1095,16 +1111,16 @@ func (e *Exporter) scrapeRedisHost(ch chan<- prometheus.Metric) error {
 type ClusterExporter struct {
 	sync.Mutex
 
-	Connection   *redisc.Client
-	ClusterNodes []*ClusterNode
-
-	promRegistry  *prometheus.Registry
-	promGatherers *prometheus.Gatherers
+	RedisEndpoint string
+	ClusterNodes  []*ClusterNode
+	Options       ExporterOptions
 
 	mTotalScrapes              prometheus.Counter
 	mScrapeDuration            prometheus.Summary
+	mLastScrapeDuration        prometheus.Summary
 	mTargetScrapeRequestErrors prometheus.Counter
 	mTotalNodes                prometheus.Gauge
+	mUP                        prometheus.Gauge
 }
 
 type ClusterNode struct {
@@ -1122,22 +1138,19 @@ type ClusterNode struct {
 
 func NewClusterExporter(addr string, opts ExporterOptions) (*ClusterExporter, error) {
 
-	rcc := redisc.NewClient(&redisc.Options{
-		Addr: addr,
-	})
 	ce := ClusterExporter{
-		Connection: rcc,
+		RedisEndpoint: addr,
+		Options:       opts,
+
 		mTotalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: opts.Namespace,
 			Name:      "exporter_scrapes_total",
 			Help:      "Current total redis scrapes.",
 		}),
-
 		mScrapeDuration: prometheus.NewSummary(prometheus.SummaryOpts{
 			Name: "exporter_scrape_duration_seconds",
 			Help: "Duration of scrape by the exporter",
 		}),
-
 		mTargetScrapeRequestErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: opts.Namespace,
 			Name:      "target_scrape_request_errors_total",
@@ -1150,11 +1163,79 @@ func NewClusterExporter(addr string, opts ExporterOptions) (*ClusterExporter, er
 				Help:      "Total nodes of Redis Cluster",
 			},
 		),
+		mLastScrapeDuration: prometheus.NewSummary(prometheus.SummaryOpts{
+			Name: "exporter_last_scrape_duration_seconds",
+			Help: "Duration of last scrape by the exporter",
+		}),
+		mUP: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace: opts.Namespace,
+				Name:      "discovery_up",
+				Help:      "Information about the Redis Cluster discovery",
+			},
+		),
 	}
+
+	return &ce, nil
+}
+
+//Collect implements required collect function for all promehteus collectors
+func (ce *ClusterExporter) Collect(ch chan<- prometheus.Metric) {
+
+	ce.Lock()
+	defer ce.Unlock()
+
+	ce.mTotalScrapes.Inc()
+	success := 1.0
+
+	start := time.Now().UnixNano()
+	err := ce.discoveryCluster()
+	if err != nil {
+		log.Errorln("ERROR discovering the cluster.")
+		success = 0.0
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(ce.ClusterNodes))
+
+	ce.mTotalNodes.Set(float64(len(ce.ClusterNodes)))
+
+	for _, c := range ce.ClusterNodes {
+		go func(node *ClusterNode) {
+			defer wg.Done()
+			node.Exporter.Collect(ch)
+		}(c)
+	}
+	wg.Wait()
+
+	registerConstMetric(ce.mUP.Desc(), ch, success, prometheus.GaugeValue, nil)
+	registerConstMetric(ce.mLastScrapeDuration.Desc(), ch, float64(time.Now().UnixNano()-start)/1000000000, prometheus.GaugeValue, nil)
+}
+
+//Describe is a Prometheus implementation to be called by collector.
+//It essentially writes all descriptors to the prometheus desc channel.
+func (ce *ClusterExporter) Describe(ch chan<- *prometheus.Desc) {
+
+	//Update this section with the each metric you create for a given collector
+	ch <- ce.mTotalScrapes.Desc()
+	ch <- ce.mScrapeDuration.Desc()
+	ch <- ce.mTargetScrapeRequestErrors.Desc()
+	ch <- ce.mTotalNodes.Desc()
+}
+
+func (ce *ClusterExporter) discoveryCluster() error {
+
+	// erase all metrics before start the new discovery
+	ce.cleanDiscovery()
+
+	rcc := redisc.NewClient(&redisc.Options{
+		Addr: ce.RedisEndpoint,
+	})
 
 	rccNodes, err := rcc.ClusterNodes().Result()
 	if err != nil {
-		log.Println("Unable to conn to ipirang")
+		log.Errorf("Unable to conn to redis endpoint %s . %s", ce.RedisEndpoint, err)
+		return err
 	}
 
 	nodesCounter := 0.0
@@ -1176,52 +1257,31 @@ func NewClusterExporter(addr string, opts ExporterOptions) (*ClusterExporter, er
 		node.PongRecv = sArr[6]
 		node.LinkState = sArr[7]
 
-		// Slave
+		// Slave only
 		if len(sArr) > 8 {
 			node.Slots = sArr[8]
 		}
 
-		ne, err := NewRedisExporter(node.Addr, opts)
+		ne, err := NewRedisExporter(node.Addr, ce.Options)
 		if err != nil {
-			log.Errorf("Error calling newRediExposter")
-			os.Exit(1)
+			log.Errorf("ERROR creating Redis Exporter.")
 		}
-		log.Debug(ne)
-
 		node.Exporter = ne
-		ce.Lock()
 		ce.ClusterNodes = append(ce.ClusterNodes, &node)
-		ce.Unlock()
 
 		nodesCounter++
 	}
 
-	ce.mTotalNodes.Set(nodesCounter)
-
-	return &ce, nil
+	return nil
 }
 
-//Collect implements required collect function for all promehteus collectors
-func (ce *ClusterExporter) Collect(ch chan<- prometheus.Metric) {
-	wg := sync.WaitGroup{}
-	wg.Add(len(ce.ClusterNodes))
-
-	for _, c := range ce.ClusterNodes {
-		go func(node *ClusterNode) {
-			defer wg.Done()
-			node.Exporter.Collect(ch)
-		}(c)
+func (ce *ClusterExporter) cleanDiscovery() {
+	for i := len(ce.ClusterNodes) - 1; i >= 0; i-- {
+		ce.ClusterNodes = removeSliceClusterNode(ce.ClusterNodes, i)
 	}
-	wg.Wait()
 }
 
-//Describe is a Prometheus implementation to be called by collector.
-//It essentially writes all descriptors to the prometheus desc channel.
-func (ce *ClusterExporter) Describe(ch chan<- *prometheus.Desc) {
-
-	//Update this section with the each metric you create for a given collector
-	ch <- ce.mTotalScrapes.Desc()
-	ch <- ce.mScrapeDuration.Desc()
-	ch <- ce.mTargetScrapeRequestErrors.Desc()
-	ch <- ce.mTotalNodes.Desc()
+func removeSliceClusterNode(s []*ClusterNode, i int) []*ClusterNode {
+	s[i] = s[len(s)-1]
+	return s[:len(s)-1]
 }
