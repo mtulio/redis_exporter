@@ -14,8 +14,6 @@ import (
 
 	redisc "github.com/go-redis/redis"
 
-	redisc "github.com/go-redis/redis"
-
 	"github.com/gomodule/redigo/redis"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -65,7 +63,6 @@ type ExporterOptions struct {
 	SkipTLSVerification bool
 	IsTile38            bool
 	ConnectionTimeouts  time.Duration
-	ClusterDiscovery    bool
 }
 
 // ScrapeHandler is the HTTP handler to gather metrics.
@@ -103,7 +100,6 @@ func (e *Exporter) ScrapeHandler(w http.ResponseWriter, r *http.Request) {
 		e.targetScrapeRequestErrors.Inc()
 		return
 	}
-
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(exp)
 
